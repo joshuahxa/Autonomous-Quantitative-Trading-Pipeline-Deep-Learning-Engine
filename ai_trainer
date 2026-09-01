@@ -1,0 +1,63 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+import torch.optim as optim
+
+class TradingLSTM(nn.Module):
+    def __init__(self, input_size=5, hidden_layer_size=64, output_size=1):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_layer_size, batch_first=True)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_seq):
+        lstm_out, _ = self.lstm(input_seq)
+        return self.sigmoid(self.linear(lstm_out[:, -1, :]))
+
+print("[*] Downloading Multi-Stock Training Data (2010-2021)...")
+training_tickers = ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL"]
+X_all, y_all = [], []
+
+for ticker in training_tickers:
+    df = yf.Ticker(ticker).history(start="2010-01-01", end="2021-12-31")
+    df['SMA_10'] = df['Close'].rolling(window=10).mean()
+    df['SMA_30'] = df['Close'].rolling(window=30).mean()
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0).rolling(window=14).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    df.dropna(inplace=True)
+
+    features = df[['Close', 'Volume', 'SMA_10', 'SMA_30', 'RSI']].values
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(features)
+
+    # 5-day lookahead target (filters out daily noise)
+    for i in range(10, len(scaled_data) - 5):
+        X_all.append(scaled_data[i-10:i])
+        y_all.append(1.0 if scaled_data[i+5, 0] > scaled_data[i, 0] else 0.0)
+
+X_tensor = torch.tensor(np.array(X_all), dtype=torch.float32)
+y_tensor = torch.tensor(np.array(y_all), dtype=torch.float32).unsqueeze(1)
+
+model = TradingLSTM(input_size=5)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+loss_fn = nn.BCELoss()
+
+print(f"[*] Training Neural Network on {len(X_all)} historical samples...")
+for epoch in range(100):
+    model.train()
+    optimizer.zero_grad()
+    predictions = model(X_tensor)
+    loss = loss_fn(predictions, y_tensor)
+    loss.backward()
+    optimizer.step()
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}/100 | Loss: {loss.item():.4f}")
+
+torch.save(model.state_dict(), r"C:\Users\joshu\Downloads\trade_brain.pth")
+print("[+] Enhanced Neural Brain successfully trained and saved!")
