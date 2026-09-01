@@ -1,0 +1,100 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from datetime import datetime
+import time
+import requests 
+
+API_KEY = "YOUR_ALPACA_API_KEY"
+SECRET_KEY = "YOUR_ALPACA_SECRET_KEY"
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+
+def send_push(message):
+    try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={message}")
+    except: pass
+
+class TradingLSTM(nn.Module):
+    def __init__(self, input_size=5, hidden_layer_size=64, output_size=1):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_layer_size, batch_first=True)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_seq):
+        lstm_out, _ = self.lstm(input_seq)
+        return self.sigmoid(self.linear(lstm_out[:, -1, :]))
+
+model = TradingLSTM(input_size=5)
+model.load_state_dict(torch.load(r"C:\Users\joshu\Downloads\trade_brain.pth", weights_only=True))
+model.eval()
+
+# --- THE MACRO FILTER ---
+vix_df = yf.Ticker("^VIX").history(period="5d")
+current_vix = float(vix_df['Close'].iloc[-1])
+print(f"\n[*] Current VIX (Market Fear): {current_vix:.2f}")
+buy_threshold = 0.80 if current_vix > 25 else 0.60
+if current_vix > 25:
+    print("[!] High Volatility Detected. Raising AI Buy Threshold to 80%.")
+
+def ai_strategy(symbol):
+    print(f"\n=== INFERENCING {symbol} ===")
+    df = yf.Ticker(symbol).history(period="150d")
+    
+    df['SMA_10'] = df['Close'].rolling(window=10).mean()
+    df['SMA_30'] = df['Close'].rolling(window=30).mean()
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0).rolling(window=14).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=14).mean()
+    df['RSI'] = 100 - (100 / (1 + (gain / loss)))
+    df.dropna(inplace=True)
+
+    features = df[['Close', 'Volume', 'SMA_10', 'SMA_30', 'RSI']].values
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(features)
+    
+    tensor_input = torch.tensor(scaled_data[-10:], dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad(): ai_confidence = model(tensor_input).item()
+        
+    print(f"[*] AI Upward Probability: {ai_confidence * 100:.2f}%")
+    
+    try:
+        pos = trading_client.get_open_position(symbol)
+        qty_avail, avg_entry = float(pos.qty_available), float(pos.avg_entry_price)
+    except:
+        qty_avail, avg_entry = 0, 0
+
+    current_price = float(df['Close'].iloc[-1])
+
+    if qty_avail > 0 and avg_entry > 0:
+        if (avg_entry - current_price) / avg_entry >= 0.05:
+            alert = f"🚨 DANGER: {symbol} STOP-LOSS TRIGGERED!"
+            print(alert); send_push(alert)
+            trading_client.submit_order(MarketOrderRequest(symbol=symbol, qty=qty_avail, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+            return
+
+    if ai_confidence > buy_threshold:
+        if qty_avail == 0:
+            invest = round(float(trading_client.get_account().cash) * 0.95, 2)
+            if invest > 10:
+                alert = f"🟢 BUY: {symbol} at {ai_confidence*100:.1f}% Confidence."
+                print(alert); send_push(alert)
+                trading_client.submit_order(MarketOrderRequest(symbol=symbol, notional=invest, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+            
+    elif ai_confidence < 0.45 and qty_avail > 0:
+        alert = f"🔴 SELL: {symbol} at {ai_confidence*100:.1f}% Confidence."
+        print(alert); send_push(alert)
+        trading_client.submit_order(MarketOrderRequest(symbol=symbol, qty=qty_avail, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+
+if __name__ == "__main__":
+    for stock in ["AAPL", "NVDA", "TSLA", "MSFT", "AMD"]:
+        ai_strategy(stock)
+        time.sleep(1)
