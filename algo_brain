@@ -18,6 +18,20 @@ TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
+import sys
+
+# 1. Force all print() statements to write to your log file
+log_path = r"C:\Users\joshu\Downloads\algo_log.txt"
+sys.stdout = open(log_path, "a", encoding="utf-8")
+
+print(f"\n=== AI EXECUTION RUN: {datetime.now()} ===")
+
+# 2. Check if the market is actually open before running
+clock = trading_client.get_clock()
+if not clock.is_open:
+    print("[-] Notice: Market closed. Exiting script to prevent order rejection.")
+    sys.exit()
+
 def send_push(message):
     try: requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={message}")
     except: pass
